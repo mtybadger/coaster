@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rollercoaster Simulator</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+        import { GUI } from 'dat.gui';
+        import RAPIER from 'https://cdn.skypack.dev/@dimforge/rapier3d-compat';
+        
+        // Make THREE available globally for debugging
+        window.THREE = THREE;
+        
+        // Constants and configuration
+        const FT_TO_M = 0.3048; // conversion factor feet to meters
+        const M_TO_FT = 1/FT_TO_M; // conversion factor meters to feet
+        const TRACK_WIDTH = 1.0; // meters between rails
+        const GRAVITY = 9.81; // m/s²
+        const SUPPORT_SPACING = 4 * FT_TO_M; // 4 feet in meters
+
+        // Main application state
+        const state = {
+            cart: {
+                mass: 228, // kg
+                width: 2.5, // meters
+                length: 1.8, // meters
+                height: 1.2, // meters
+                position: { x: 0, y: 0, z: 0 },
+                velocity: 0, // m/s
+                distanceAlongTrack: 0, // meters from start of track
+                forces: { vertical: 1, lateral: 0, longitudinal: 0 }
+            },
+            track: {
+                points: [], // Will be populated with 3D points
+                staticFriction: 0.20, // Static friction coefficient
+                rollingFriction: 0.1, // Rolling friction coefficient
+                length: 0 // total track length
+            },
+            simulation: {
+                running: false,
+                elapsedTime: 0, // seconds
+                timeStep: 1/60 // seconds
+            }
+        };
+
+        // Support-related variables
+        let MAX_SAFE_LOAD = state.cart.mass * 4 * GRAVITY; // N - maximum safe load per support
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        let hoveredSupport = null;
+        let tooltipDiv = null;
+
+        let supports = {
+            meshes: [],
+            loads: [],
+            peakLoads: [], // Track maximum load for each support
+            distances: []  // Store distance along track for each support
+        };
+
+        // Add after state declaration
+        const G_FORCE_LIMITS = {
+            vertical: {
+                min: -3.0,  // Negative G limit
+                max: 6.0    // Positive G limit
+            },
+            lateral: {
+                min: -2.0,
+                max: 2.0
+            },
+            longitudinal: {
+                min: -2.5,
+                max: 2.5
+            }
+        };
+
+        const DISTANCE_SAMPLES = 500; // Number of sample points along track
+        const EMA_SMOOTHING = 0.15; // EMA smoothing factor (0-1), lower = more smoothing
+        const CART_LENGTH_SAMPLES = Math.ceil(DISTANCE_SAMPLES * (state.cart.length / state.track.length)); // Number of samples to smooth over
+
+        let gForceCharts = {
+            vertical: null,
+            lateral: null,
+            longitudinal: null
+        };
+
+        // Store G-forces by distance
+        let gForceByDistance = {
+            vertical: new Array(DISTANCE_SAMPLES).fill(null),
+            lateral: new Array(DISTANCE_SAMPLES).fill(null),
+            longitudinal: new Array(DISTANCE_SAMPLES).fill(null)
+        };
+
+        // Store smoothed G-forces
+        let smoothedGForces = {
+            vertical: new Array(DISTANCE_SAMPLES).fill(null),
+            lateral: new Array(DISTANCE_SAMPLES).fill(null),
+            longitudinal: new Array(DISTANCE_SAMPLES).fill(null)
+        };
+
+        // Add after document.getElementById('container').appendChild(renderer.domElement);
+        // Create tooltip div
+        tooltipDiv = document.createElement('div');
+        tooltipDiv.className = 'support-tooltip';
+        tooltipDiv.style.display = 'none';
+        document.getElementById('container').appendChild(tooltipDiv);
+
+        // Add mousemove event listener
+        document.addEventListener('mousemove', onMouseMove);
+
+        function smoothGForces() {
+            const types = ['vertical', 'lateral', 'longitudinal'];
+            
+            for (const type of types) {
+                // Initialize EMA with first valid value
+                let ema = null;
+                let firstValidIndex = gForceByDistance[type].findIndex(v => v !== null);
+                if (firstValidIndex >= 0) {
+                    ema = gForceByDistance[type][firstValidIndex];
+                }
+                
+                // Calculate EMA for each point
+                for (let i = 0; i < DISTANCE_SAMPLES; i++) {
+                    const value = gForceByDistance[type][i];
+                    if (value !== null) {
+                        if (ema === null) {
+                            ema = value;
+                        } else {
+                            ema = (EMA_SMOOTHING * value) + ((1 - EMA_SMOOTHING) * ema);
+                        }
+                        smoothedGForces[type][i] = ema;
+                    } else {
+                        smoothedGForces[type][i] = null;
+                    }
+                }
+            }
+        }
+
+        let gForceChart;
+
+        // Sample track points (in feet, will be converted to meters)
+        const defaultTrackPoints = [
+            { x: 0, y: 23, z: 0, banking: 0.0 },
+            { x: 0, y: 22.5, z: 2, banking: 0.0 },
+            { x: 0, y: 11.5, z: 15.5, banking: 0.0 },
+            { x: 0, y: 9, z: 29, banking: 0.3 },
+            { x: 0, y: 8, z: 40, banking: 0.5 },
+            { x: -7.25, y: 8, z: 48, banking: 0.8 },
+            { x: -19, y: 8, z: 40, banking: 0.5 },
+            { x: -19, y: 3, z: 26.5, banking: 0 },
+            { x: -19, y: 10, z: 11.5, banking: 0 },
+            { x: -19, y: 4, z: -6.5, banking: 0 },
+            { x: -19, y: 6.8, z: -19, banking: 0 },
+            { x: -19, y: 3.5, z: -32, banking: 0 },
+            { x: -19, y: 3, z: -36, banking: 0.5 },
+            { x: -11, y: 3, z: -43.5, banking: 0.8 },
+            { x: 0, y: 3, z: -36, banking: 0.5 },
+            { x: 0, y: 3, z: -18.5, banking: 0 },
+            { x: 0, y: 5, z: -10.5, banking: 0 },
+            { x: 0, y: 8, z: -8, banking: 0 },
+            { x: 0, y: 24, z: -7, banking: 0 },
+        ];
+
+        // Convert track points from feet to meters
+        const trackPointsInMeters = defaultTrackPoints.map(p => ({
+            x: p.x * FT_TO_M,
+            y: p.y * FT_TO_M,
+            z: p.z * FT_TO_M,
+            banking: p.banking
+        }));
+
+        // Initialize Three.js
+        let scene, camera, renderer, controls;
+        let track, cart, spline;
+        let clock = new THREE.Clock();
+        
+        // Initialize Rapier.js
+        let world;
+        let cartRigidBody;
+        let trackNodes = [];
+        let splineDistance = 0;
+        let prevCartVelocity = new THREE.Vector3();
+        let cartSplineT = 0; // Parameter t (0 to 1) along the spline
+        let cartVelocity = 0; // Velocity along the spline
+
+        // Initialize GUI
+        let gui;
+
+        // Wait for Rapier to initialize
+        async function startSimulation() {
+            await RAPIER.init();
+            init();
+            animate();
+        }
+        
+        startSimulation();
+
+        function init() {
+            // Initialize the scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x00);
+            
+            // Add lighting
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambientLight);
+            
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(100, 100, 50);
+            scene.add(directionalLight);
+            
+            // Initialize camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.set(30, 30, 30);
+            
+            // Initialize renderer
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.shadowMap.enabled = true;
+            document.getElementById('container').appendChild(renderer.domElement);
+            
+            // Add orbit controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            
+            // Add grid helper
+            const gridSize = 60;
+            const gridDivisions = 60;
+            const gridHelper = new THREE.GridHelper(gridSize, gridDivisions, 0x444444, 0x888888);
+            scene.add(gridHelper);
+            
+            // Initialize physics world
+            initializePhysics();
+            
+            // Initialize track
+            state.track.points = trackPointsInMeters.map(p => ({ x: p.x, y: p.y, z: p.z, banking: p.banking }));
+            createTrack();
+            
+            // Initialize cart
+            createCart();
+            
+            // Initialize GUI
+            setupGUI();
+            
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize);
+            
+            // Start simulation
+            state.simulation.running = true;
+            
+            // Initialize G-force chart
+            initializeGForceCharts();
+            
+            // Create track supports
+            createTrackSupports();
+        }
+
+        function initializePhysics() {
+            // Create a Rapier physics world with gravity
+            world = new RAPIER.World({ x: 0, y: -GRAVITY, z: 0 });
+        }
+
+        function createTrack() {
+            // Clear existing track
+            if (track) scene.remove(track);
+            
+            // Create spline from points
+            const points = state.track.points.map(p => new THREE.Vector3(p.x, p.y, p.z));
+            spline = new THREE.CatmullRomCurve3(points);
+            spline.closed = false;
+
+            // Store track length
+            state.track.length = calculateTrackLength();
+
+            // Create points for edge splines
+            const numPoints = 1000;
+            const leftPoints = [];
+            const rightPoints = [];
+            trackNodes = [];
+            
+            // Calculate rail positions
+            const halfWidth = TRACK_WIDTH / 2;
+            
+            // First pass: calculate total arc length
+            let arcLengths = [0];
+            let totalLength = 0;
+            let prevPoint = spline.getPoint(0);
+            
+            for (let i = 1; i <= numPoints; i++) {
+                const t = i / numPoints;
+                const point = spline.getPoint(t);
+                totalLength += point.distanceTo(prevPoint);
+                arcLengths.push(totalLength);
+                prevPoint = point;
+            }
+            
+            // Second pass: create nodes at equal arc-length intervals
+            const numNodes = 1000;
+            const segmentLength = totalLength / numNodes;
+            let currentSegment = 0;
+            let currentLength = 0;
+            
+            // // Create node marker geometry and material
+            // const nodeGeometry = new THREE.SphereGeometry(0.2, 8, 8);
+            // const nodeMaterial = new THREE.MeshStandardMaterial({ 
+            //     color: 0xff8800,
+            //     roughness: 0.5,
+            //     metalness: 0.5
+            // });
+            
+            // Create a group for track and nodes
+            track = new THREE.Group();
+            
+            for (let i = 0; i < numPoints; i++) {
+                const t = i / (numPoints - 1);
+                const centerPoint = spline.getPoint(t);
+                const tangent = spline.getTangentAt(t).normalize();
+                
+                // Calculate right vector
+                const worldUp = new THREE.Vector3(0, 1, 0);
+                const right = new THREE.Vector3().crossVectors(tangent, worldUp).normalize();
+                
+                // Interpolate banking angle
+                let bankingAngle = 0;
+                for (let j = 0; j < state.track.points.length - 1; j++) {
+                    const t1 = j / (state.track.points.length - 1);
+                    const t2 = (j + 1) / (state.track.points.length - 1);
+                    if (t >= t1 && t <= t2) {
+                        const alpha = (t - t1) / (t2 - t1);
+                        bankingAngle = THREE.MathUtils.lerp(
+                            state.track.points[j].banking,
+                            state.track.points[j + 1].banking,
+                            alpha
+                        );
+                        break;
+                    }
+                }
+                
+                // Apply banking rotation to right vector
+                const bankingMatrix = new THREE.Matrix4().makeRotationAxis(tangent, bankingAngle);
+                right.applyMatrix4(bankingMatrix);
+                
+                // Calculate up vector based on banked right vector
+                const up = new THREE.Vector3().crossVectors(right, tangent).normalize();
+                
+                // Calculate edge points with banking
+                const leftEdge = new THREE.Vector3().addVectors(centerPoint, right.clone().multiplyScalar(-halfWidth));
+                const rightEdge = new THREE.Vector3().addVectors(centerPoint, right.clone().multiplyScalar(halfWidth));
+                
+                leftPoints.push(leftEdge);
+                rightPoints.push(rightEdge);
+                
+                // Store track node data at equal arc-length intervals
+                if (arcLengths[i] >= currentLength) {
+                    trackNodes.push({
+                        position: centerPoint.clone(),
+                        tangent: tangent.clone(),
+                        up: up.clone(),
+                        right: right.clone(),
+                        bankingAngle: bankingAngle,
+                        t: t,
+                        arcLength: arcLengths[i]
+                    });
+                    
+                    // // Create and add node marker
+                    // const nodeMesh = new THREE.Mesh(nodeGeometry, nodeMaterial);
+                    // nodeMesh.position.copy(centerPoint);
+                    // track.add(nodeMesh);
+                    
+                    currentLength += segmentLength;
+                }
+            }
+            
+            // Ensure we have a node at the end
+            const endT = 1;
+            const endPoint = spline.getPoint(endT);
+            const endTangent = spline.getTangentAt(endT).normalize();
+            const endRight = new THREE.Vector3().crossVectors(endTangent, new THREE.Vector3(0, 1, 0)).normalize();
+            const endUp = new THREE.Vector3().crossVectors(endRight, endTangent).normalize();
+            
+            trackNodes.push({
+                position: endPoint.clone(),
+                tangent: endTangent.clone(),
+                up: endUp.clone(),
+                right: endRight.clone(),
+                bankingAngle: state.track.points[state.track.points.length - 1].banking,
+                t: endT,
+                arcLength: totalLength
+            });
+            
+            // Add end node marker
+            // const endNodeMesh = new THREE.Mesh(nodeGeometry, nodeMaterial);
+            // endNodeMesh.position.copy(endPoint);
+            // track.add(endNodeMesh);
+            
+            // Log node distribution info
+            console.log('Track nodes:', trackNodes.length);
+            console.log('Total track length:', totalLength);
+            console.log('Target segment length:', segmentLength);
+            console.log('Node spacing:');
+            for (let i = 1; i < trackNodes.length; i++) {
+                const spacing = trackNodes[i].arcLength - trackNodes[i-1].arcLength;
+                console.log(`Node ${i}: ${spacing.toFixed(2)}m (t: ${trackNodes[i].t.toFixed(3)})`);
+            }
+            
+            // Create geometries for left and right lines
+            const leftGeometry = new THREE.BufferGeometry().setFromPoints(leftPoints);
+            const rightGeometry = new THREE.BufferGeometry().setFromPoints(rightPoints);
+            
+            // Create materials
+            const railMaterial = new THREE.LineBasicMaterial({ color: 0x00ff00, linewidth: 2 });
+            
+            // Create lines
+            const leftLine = new THREE.Line(leftGeometry, railMaterial);
+            const rightLine = new THREE.Line(rightGeometry, railMaterial);
+            
+            // Add rails to track group
+            track.add(leftLine);
+            track.add(rightLine);
+            
+            scene.add(track);
+            
+            // Create track supports
+            createTrackSupports();
+        }
+
+        function calculateTrackLength() {
+            const numSamples = 1000;
+            let length = 0;
+            let prevPoint = spline.getPoint(0);
+            
+            for (let i = 1; i <= numSamples; i++) {
+                const t = i / numSamples;
+                const point = spline.getPoint(t);
+                length += point.distanceTo(prevPoint);
+                prevPoint = point;
+            }
+            
+            return length;
+        }
+
+        function createCart() {
+            // Remove existing cart
+            if (cart) scene.remove(cart);
+            
+            // Create visual cart
+            const cartGeometry = new THREE.BoxGeometry(
+                state.cart.length, 
+                state.cart.height, 
+                state.cart.width
+            );
+            cartGeometry.translate(0, state.cart.height / 2, 0);
+            
+            const cartMaterial = new THREE.MeshStandardMaterial({ 
+                color: 0xff0000,
+                roughness: 0.5,
+                metalness: 0.3
+            });
+            const cartMesh = new THREE.Mesh(cartGeometry, cartMaterial);
+            
+            cart = new THREE.Group();
+            cart.add(cartMesh);
+            
+            scene.add(cart);
+            
+            // Create physics cart
+            createCartPhysics();
+        }
+
+        function createCartPhysics() {
+            // Clean up existing physics objects
+            if (cartRigidBody) {
+                world.removeRigidBody(cartRigidBody);
+            }
+            
+            // Start point and orientation
+            const startPoint = spline.getPoint(0);
+            const startNode = trackNodes[0];
+            
+            // Create rigid body description
+            const rigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
+                .setTranslation(startPoint.x, startPoint.y + 0.1, startPoint.z)
+                .setLinearDamping(state.track.staticFriction);
+            
+            // Create rigid body
+            cartRigidBody = world.createRigidBody(rigidBodyDesc);
+            
+            // Create collider description (box)
+            const colliderDesc = RAPIER.ColliderDesc.cuboid(
+                state.cart.length / 2,
+                state.cart.height / 2,
+                state.cart.width / 2
+            );
+            
+            // Set the mass and friction
+            colliderDesc.setMass(state.cart.mass);
+            colliderDesc.setFriction(state.track.rollingFriction);
+            
+            // Create collider and attach to rigid body
+            world.createCollider(colliderDesc, cartRigidBody);
+            
+            // Set initial rotation based on track
+            const rotMatrix = new THREE.Matrix4().makeBasis(
+                startNode.tangent,
+                startNode.up,
+                startNode.right
+            );
+            const quaternion = new THREE.Quaternion().setFromRotationMatrix(rotMatrix);
+            cartRigidBody.setRotation(
+                { x: quaternion.x, y: quaternion.y, z: quaternion.z, w: quaternion.w },
+                true
+            );
+            
+            // Initialize previous velocity for acceleration calculation
+            prevCartVelocity = new THREE.Vector3(0, 0, 0);
+            
+            // Initialize spline distance
+            splineDistance = 0;
+        }
+
+        function updatePhysics() {
+            if (!state.simulation.running) return;
+            
+            // Simple physics for cart sliding along the spline
+            updateCartOnSpline();
+            
+            // Step the physics world (for any additional physics objects)
+            world.step();
+            
+            // Update simulation time
+            state.simulation.elapsedTime += state.simulation.timeStep;
+            
+            // Update visual representation
+            updateVisuals();
+            
+            // Update UI
+            updateUI();
+            
+            // Update track supports
+            updateSupports();
+        }
+        
+        function updateCartOnSpline() {
+            // Get current tangent at spline position
+            const tangent = spline.getTangentAt(cartSplineT).normalize();
+            
+            // Calculate gravity component along the tangent
+            const gravityVector = new THREE.Vector3(0, -GRAVITY, 0);
+            const gravityAlongTrack = gravityVector.dot(tangent);
+            
+            // Calculate total force along track
+            const totalForce = gravityAlongTrack;
+            
+            // Calculate static friction threshold
+            const normalForce = Math.sqrt(GRAVITY * GRAVITY - gravityAlongTrack * gravityAlongTrack);
+            const staticFrictionThreshold = state.track.staticFriction * normalForce;
+            
+            // Check if cart should start moving (overcome static friction)
+            const netForce = Math.abs(totalForce) - staticFrictionThreshold;
+            
+            if (Math.abs(cartVelocity) < 0.01 && netForce <= 0) {
+                // Cart is stopped and static friction prevents movement
+                cartVelocity = 0;
+            } else {
+                // Cart is moving or force overcomes static friction
+                // Calculate rolling friction force (always opposes motion)
+                const rollingFrictionForce = state.track.rollingFriction * normalForce;
+                const frictionDirection = cartVelocity >= 0 ? -1 : 1;
+                
+                // Update velocity based on net forces
+                const acceleration = totalForce + (frictionDirection * rollingFrictionForce);
+                cartVelocity += acceleration * state.simulation.timeStep;
+            }
+            
+            // Calculate how far to move along spline
+            const distanceToMove = cartVelocity * state.simulation.timeStep;
+            
+            // Convert distance to spline parameter change
+            const tChange = distanceToMove / state.track.length;
+            
+            // Update cart position along spline
+            cartSplineT += tChange;
+            
+            // Keep t within [0, 1]
+            cartSplineT = Math.max(0, Math.min(1, cartSplineT));
+            
+            // Get current position and orientation from spline
+            const currentPoint = spline.getPointAt(cartSplineT);
+            
+            // Find closest node for orientation info
+            let closestNode = trackNodes[0];
+            let minDist = Number.MAX_VALUE;
+            for (const node of trackNodes) {
+                const dist = Math.abs(node.t - cartSplineT);
+                if (dist < minDist) {
+                    minDist = dist;
+                    closestNode = node;
+                }
+            }
+            
+            // Calculate rotation based on track orientation
+            const rotMatrix = new THREE.Matrix4().makeBasis(
+                closestNode.tangent,
+                closestNode.up,
+                closestNode.right
+            );
+            const quaternion = new THREE.Quaternion().setFromRotationMatrix(rotMatrix);
+            
+            // Update cart position and rotation directly
+            cart.position.copy(currentPoint);
+            cart.quaternion.copy(quaternion);
+            
+            // Update cart state for display
+            state.cart.velocity = cartVelocity;
+            state.cart.distanceAlongTrack = cartSplineT * state.track.length;
+            
+            // Calculate approximate acceleration for G-forces
+            const prevVelocity = prevCartVelocity.clone();
+            const currentVelocity = tangent.clone().multiplyScalar(cartVelocity);
+            const acceleration = new THREE.Vector3()
+                .subVectors(currentVelocity, prevVelocity)
+                .divideScalar(state.simulation.timeStep);
+                
+            // Store current velocity for next frame
+            prevCartVelocity.copy(currentVelocity);
+            
+            // Calculate G-forces
+            calculateGForces(closestNode.tangent, closestNode.up, closestNode.right, acceleration);
+        }
+
+        function calculateGForces(tangent, up, right, acceleration) {
+            // Add gravity acceleration (always present)
+            const gravityAccel = new THREE.Vector3(0, -GRAVITY, 0);
+            
+            // Total acceleration relative to free-fall
+            const totalAccel = acceleration.clone().sub(gravityAccel);
+            
+            // Project onto cart's local axes
+            // Note: We're measuring G-force as felt by the rider
+            // Positive G = pushed into seat (normal gravity = 1G)
+            // For vertical, we flip the sign and add 1 to make "normal" = 1G
+            const verticalG = -totalAccel.dot(up) / GRAVITY; // Normal gravity is 1G upward
+            const lateralG = totalAccel.dot(right) / GRAVITY;
+            const longitudinalG = totalAccel.dot(tangent) / GRAVITY;
+            
+            // Store G-forces
+            state.cart.forces.vertical = -verticalG;
+            state.cart.forces.lateral = lateralG;
+            state.cart.forces.longitudinal = longitudinalG;
+        }
+
+        function updateVisuals() {
+            // Cart is already updated in updateCartOnSpline
+            // This function is kept for potential future visual updates
+        }
+
+        function updateUI() {
+            // Update text elements
+            document.getElementById('speed').textContent = Math.abs(state.cart.velocity).toFixed(1);
+            document.getElementById('g-vertical').textContent = state.cart.forces.vertical.toFixed(2);
+            document.getElementById('g-lateral').textContent = state.cart.forces.lateral.toFixed(2);
+            document.getElementById('g-longitudinal').textContent = state.cart.forces.longitudinal.toFixed(2);
+            
+            // Calculate current distance index
+            const distanceIndex = Math.floor((state.cart.distanceAlongTrack / state.track.length) * DISTANCE_SAMPLES);
+            if (distanceIndex >= 0 && distanceIndex < DISTANCE_SAMPLES) {
+                // Update G-force data at current distance
+                gForceByDistance.vertical[distanceIndex] = state.cart.forces.vertical;
+                gForceByDistance.lateral[distanceIndex] = state.cart.forces.lateral;
+                gForceByDistance.longitudinal[distanceIndex] = state.cart.forces.longitudinal;
+                
+                // Apply smoothing
+                smoothGForces();
+                
+                // Update charts with smoothed data
+                gForceCharts.vertical.data.datasets[0].data = [...smoothedGForces.vertical];
+                gForceCharts.lateral.data.datasets[0].data = [...smoothedGForces.lateral];
+                gForceCharts.longitudinal.data.datasets[0].data = [...smoothedGForces.longitudinal];
+                
+                // Update all charts
+                Object.values(gForceCharts).forEach(chart => chart.update('none'));
+            }
+        }
+
+        function setupGUI() {
+            gui = new GUI({ autoPlace: false });
+            document.getElementById('container').appendChild(gui.domElement);
+            gui.domElement.style.position = 'absolute';
+            gui.domElement.style.top = '10px';
+            gui.domElement.style.right = '10px';
+            
+            // Cart parameters
+            const cartFolder = gui.addFolder('Cart');
+            cartFolder.add(state.cart, 'mass', 50, 500).name('Mass (kg)').onChange(() => {
+                if (cartRigidBody) {
+                    // We need to recreate the cart physics with new mass
+                    createCartPhysics();
+                }
+            });
+            cartFolder.open();
+            
+            // Track parameters
+            const trackFolder = gui.addFolder('Track');
+            trackFolder.add(state.track, 'staticFriction', 0.01, 0.5)
+                .name('Static Friction')
+                .onChange(() => {
+                    if (cartRigidBody) {
+                        cartRigidBody.setLinearDamping(state.track.staticFriction);
+                    }
+                });
+            trackFolder.add(state.track, 'rollingFriction', 0.01, 0.2)
+                .name('Rolling Friction')
+                .onChange(() => {
+                    if (cartRigidBody) {
+                        const collider = world.getCollider(0);
+                        if (collider) {
+                            collider.setFriction(state.track.rollingFriction);
+                        }
+                    }
+                });
+            trackFolder.open();
+            
+            // Simulation controls
+            const simFolder = gui.addFolder('Simulation');
+            simFolder.add(state.simulation, 'running').name('Running');
+            simFolder.add({ reset: resetSimulation }, 'reset').name('Reset');
+            simFolder.open();
+        }
+
+        function resetSimulation() {
+            state.simulation.elapsedTime = 0;
+            
+            // Reset spline parameters
+            cartSplineT = 0;
+            cartVelocity = 0;
+            prevCartVelocity.set(0, 0, 0);
+            
+            // Get starting position and orientation
+            const startPoint = spline.getPoint(0);
+            const startNode = trackNodes[0];
+            
+            // Set initial position and rotation
+            cart.position.copy(startPoint);
+            const rotMatrix = new THREE.Matrix4().makeBasis(
+                startNode.tangent,
+                startNode.up,
+                startNode.right
+            );
+            const quaternion = new THREE.Quaternion().setFromRotationMatrix(rotMatrix);
+            cart.quaternion.copy(quaternion);
+            
+            // Reset cart state
+            state.cart.velocity = 0;
+            state.cart.distanceAlongTrack = 0;
+            state.cart.forces = { vertical: 1, lateral: 0, longitudinal: 0 }; // Normal gravity is 1G upward
+            
+            // Reset G-force data
+            gForceByDistance.vertical.fill(null);
+            gForceByDistance.lateral.fill(null);
+            gForceByDistance.longitudinal.fill(null);
+            
+            // Reset smoothed data
+            smoothedGForces.vertical.fill(null);
+            smoothedGForces.lateral.fill(null);
+            smoothedGForces.longitudinal.fill(null);
+            
+            // Update all charts
+            Object.values(gForceCharts).forEach(chart => {
+                chart.data.datasets[0].data = new Array(DISTANCE_SAMPLES).fill(null);
+                chart.update();
+            });
+            
+            // Reset support loads and peaks
+            supports.loads.fill(0);
+            supports.peakLoads.fill(0);
+            supports.meshes.forEach(mesh => {
+                const colors = mesh.geometry.attributes.color.array;
+                colors.fill(0.8);
+                mesh.geometry.attributes.color.needsUpdate = true;
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            
+            const delta = Math.min(clock.getDelta(), 0.1);
+            state.simulation.timeStep = delta;
+            
+            updatePhysics();
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        function createGForceChart(ctx, title, minY, maxY, baseColor) {
+            return new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: Array(DISTANCE_SAMPLES).fill(''),
+                    datasets: [{
+                        label: title,
+                        data: new Array(DISTANCE_SAMPLES).fill(null),
+                        borderColor: baseColor,
+                        segment: {
+                            borderColor: ctx => {
+                                const value = ctx.p1.parsed.y;
+                                if (value === null) return baseColor;
+                                if (title === 'Vertical G' && (value < G_FORCE_LIMITS.vertical.min || value > G_FORCE_LIMITS.vertical.max)) {
+                                    return 'rgb(255, 99, 132)';
+                                }
+                                if (title === 'Lateral G' && (value < G_FORCE_LIMITS.lateral.min || value > G_FORCE_LIMITS.lateral.max)) {
+                                    return 'rgb(255, 99, 132)';
+                                }
+                                if (title === 'Longitudinal G' && (value < G_FORCE_LIMITS.longitudinal.min || value > G_FORCE_LIMITS.longitudinal.max)) {
+                                    return 'rgb(255, 99, 132)';
+                                }
+                                return baseColor;
+                            }
+                        },
+                        tension: 0.3,
+                        spanGaps: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Track Distance (m)',
+                                color: 'rgba(255, 255, 255, 0.7)'
+                            },
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.7)',
+                                maxRotation: 0,
+                                callback: function(value) {
+                                    if (value % 100 === 0) {
+                                        return (value * state.track.length / DISTANCE_SAMPLES).toFixed(0);
+                                    }
+                                    return '';
+                                }
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
+                        },
+                        y: {
+                            suggestedMin: minY,
+                            suggestedMax: maxY,
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            },
+                            ticks: {
+                                color: 'rgba(255, 255, 255, 0.7)'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: 'rgba(255, 255, 255, 0.7)'
+                            },
+                            position: 'top'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(context) {
+                                    const index = context[0].dataIndex;
+                                    const distance = (index * state.track.length / DISTANCE_SAMPLES).toFixed(1);
+                                    return `Distance: ${distance}m`;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function initializeGForceCharts() {
+            const container = document.getElementById('graphs');
+            container.innerHTML = `
+                <div class="graph-container">
+                    <canvas id="verticalGChart"></canvas>
+                </div>
+                <div class="graph-container">
+                    <canvas id="lateralGChart"></canvas>
+                </div>
+                <div class="graph-container">
+                    <canvas id="longitudinalGChart"></canvas>
+                </div>
+            `;
+            
+            gForceCharts.vertical = createGForceChart(
+                document.getElementById('verticalGChart').getContext('2d'),
+                'Vertical G',
+                -4,
+                6,
+                'rgb(75, 192, 192)'
+            );
+            
+            gForceCharts.lateral = createGForceChart(
+                document.getElementById('lateralGChart').getContext('2d'),
+                'Lateral G',
+                -3,
+                3,
+                'rgb(153, 102, 255)'
+            );
+            
+            gForceCharts.longitudinal = createGForceChart(
+                document.getElementById('longitudinalGChart').getContext('2d'),
+                'Longitudinal G',
+                -3,
+                3,
+                'rgb(255, 205, 86)'
+            );
+        }
+
+        function createTrackSupports() {
+            // Remove existing supports
+            supports.meshes.forEach(mesh => scene.remove(mesh));
+            supports.meshes = [];
+            supports.loads = [];
+            supports.peakLoads = [];
+            supports.distances = [];
+            
+            // Create material for supports
+            const supportMaterial = new THREE.MeshPhongMaterial({
+                color: 0x888888,
+                vertexColors: true,
+                transparent: true,
+                opacity: 1
+            });
+            
+            // Calculate number of supports needed
+            const trackLength = state.track.length;
+            const numSupports = Math.ceil(trackLength / SUPPORT_SPACING);
+            
+            // Create supports along the track
+            for (let i = 0; i < numSupports; i++) {
+                const t = (i * SUPPORT_SPACING) / trackLength;
+                if (t > 1) break;
+                
+                const trackPoint = spline.getPointAt(t);
+                const groundPoint = new THREE.Vector3(trackPoint.x, 0, trackPoint.z);
+                
+                // Create support geometry
+                const height = trackPoint.y;
+                const supportGeometry = new THREE.CylinderGeometry(0.1, 0.1, height, 8);
+                supportGeometry.translate(0, height/2, 0);
+                
+                // Create support mesh with vertex colors
+                const colors = new Float32Array(supportGeometry.attributes.position.count * 3);
+                colors.fill(0.8); // Start with light gray
+                supportGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                
+                const supportMesh = new THREE.Mesh(supportGeometry, supportMaterial.clone());
+                supportMesh.position.copy(groundPoint);
+                
+                // Store support data
+                supports.meshes.push(supportMesh);
+                supports.loads.push(0);
+                supports.peakLoads.push(0);
+                supports.distances.push(t * trackLength);
+                
+                scene.add(supportMesh);
+            }
+        }
+
+        function updateSupports() {
+            if (!state.simulation.running) return;
+            
+            // Reset current loads
+            supports.loads.fill(0);
+            
+            // Calculate cart's influence on nearby supports
+            const cartT = state.cart.distanceAlongTrack / state.track.length;
+            const cartPoint = spline.getPointAt(cartT);
+            const cartMass = state.cart.mass;
+            
+            // Calculate vertical force including G-force
+            const verticalLoad = cartMass * (state.cart.forces.vertical * GRAVITY);
+            
+            // Find the two nearest supports
+            const supportIndex = Math.floor(cartT * state.track.length / SUPPORT_SPACING);
+            const distanceToNext = (cartT * state.track.length) % SUPPORT_SPACING;
+            
+            // Distribute load between supports based on distance
+            if (supportIndex >= 0 && supportIndex < supports.loads.length - 1) {
+                const ratio = distanceToNext / SUPPORT_SPACING;
+                const load1 = verticalLoad * (1 - ratio);
+                const load2 = verticalLoad * ratio;
+                
+                supports.loads[supportIndex] += load1;
+                supports.loads[supportIndex + 1] += load2;
+                
+                // Update peak loads
+                supports.peakLoads[supportIndex] = Math.max(supports.peakLoads[supportIndex], Math.abs(load1));
+                supports.peakLoads[supportIndex + 1] = Math.max(supports.peakLoads[supportIndex + 1], Math.abs(load2));
+            }
+            
+            // Update support colors based on load
+            supports.meshes.forEach((mesh, index) => {
+                const load = Math.abs(supports.loads[index]);
+                const loadRatio = Math.min(load / MAX_SAFE_LOAD, 1);
+                
+                // Color interpolation: green (0,1,0) -> yellow (1,1,0) -> red (1,0,0)
+                let r, g, b;
+                if (loadRatio < 0.5) {
+                    // Green to Yellow
+                    r = loadRatio * 2;
+                    g = 1;
+                    b = 0;
+                } else {
+                    // Yellow to Red
+                    r = 1;
+                    g = 1 - (loadRatio - 0.5) * 2;
+                    b = 0;
+                }
+                
+                const colors = mesh.geometry.attributes.color.array;
+                for (let i = 0; i < colors.length; i += 3) {
+                    colors[i] = r;
+                    colors[i + 1] = g;
+                    colors[i + 2] = b;
+                }
+                mesh.geometry.attributes.color.needsUpdate = true;
+            });
+        }
+
+        function onMouseMove(event) {
+            // Calculate mouse position in normalized device coordinates (-1 to +1)
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            
+            // Update raycaster
+            raycaster.setFromCamera(mouse, camera);
+            
+            // Check for intersections with support beams
+            const intersects = raycaster.intersectObjects(supports.meshes);
+            
+            if (intersects.length > 0) {
+                const intersectedSupport = intersects[0].object;
+                const supportIndex = supports.meshes.indexOf(intersectedSupport);
+                
+                // Show tooltip
+                tooltipDiv.style.display = 'block';
+                tooltipDiv.style.left = event.clientX + 10 + 'px';
+                tooltipDiv.style.top = event.clientY + 10 + 'px';
+                
+                // Format load values (all in Newtons)
+                const currentLoad = Math.abs(supports.loads[supportIndex]);
+                const peakLoad = supports.peakLoads[supportIndex];
+                const distance = supports.distances[supportIndex];
+                
+                tooltipDiv.innerHTML = `
+                    Distance: ${distance.toFixed(1)}m<br>
+                    Current Load: ${currentLoad.toFixed(1)} N (${(currentLoad/GRAVITY).toFixed(1)} kg)<br>
+                    Peak Load: ${peakLoad.toFixed(1)} N (${(peakLoad/GRAVITY).toFixed(1)} kg)<br>
+                    Safety: ${((peakLoad / MAX_SAFE_LOAD) * 100).toFixed(1)}%
+                `;
+                
+                hoveredSupport = intersectedSupport;
+                hoveredSupport.material.opacity = 0.7; // Highlight hovered support
+            } else {
+                tooltipDiv.style.display = 'none';
+                if (hoveredSupport) {
+                    hoveredSupport.material.opacity = 1;
+                    hoveredSupport = null;
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: monospace;
+        }
+        #container {
+            position: relative;
+            width: 100%;
+            height: 100vh;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            pointer-events: none;
+        }
+        #graphs {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            width: 95%;
+            height: 200px;
+            display: flex;
+            flex-direction: row;
+            gap: 10px;
+        }
+        .graph-container {
+            flex: 1;
+            position: relative;
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 3px;
+            min-width: 0; /* Allows flex items to shrink below content size */
+        }
+        canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+        .support-tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 12px;
+            pointer-events: none;
+            z-index: 1000;
+            white-space: nowrap;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="info">
+            <div id="stats">
+                <p>Speed: <span id="speed">0</span> m/s</p>
+                <p>Vertical G-Force: <span id="g-vertical">1</span> G</p>
+                <p>Lateral G-Force: <span id="g-lateral">0</span> G</p>
+                <p>Longitudinal G-Force: <span id="g-longitudinal">0</span> G</p>
+            </div>
+        </div>
+        <div id="graphs">
+            <div class="graph-container">
+                <canvas id="verticalGChart"></canvas>
+            </div>
+            <div class="graph-container">
+                <canvas id="lateralGChart"></canvas>
+            </div>
+            <div class="graph-container">
+                <canvas id="longitudinalGChart"></canvas>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
